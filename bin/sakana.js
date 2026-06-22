@@ -3,11 +3,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import readline from "node:readline/promises";
+import readlinePromises from "node:readline/promises";
+import { clearLine, cursorTo, moveCursor } from "node:readline";
 import { spawn } from "node:child_process";
 import { stdin as input, stdout as output } from "node:process";
 
-const VERSION = "0.6.0";
+const VERSION = "0.8.0";
 const DEFAULT_BASE_URL = "https://api.sakana.ai/v1";
 const DEFAULT_MODEL = "fugu";
 const DEFAULT_UPDATE_SOURCE = "github:YuK1Game/sakana-cli#main";
@@ -16,6 +17,17 @@ const MAX_FILE_BYTES = 40_000;
 const MAX_COMMAND_OUTPUT_BYTES = 30_000;
 const MAX_AGENT_TURNS = 20;
 const ATTACHMENT_RE = /(?<!\S)@([^\s]+)/g;
+const SLASH_COMMANDS = [
+  { name: "/help", description: "Show command list" },
+  { name: "/status", description: "Show current settings" },
+  { name: "/model", description: "Switch model: fugu or fugu-ultra" },
+  { name: "/reset", description: "Clear conversation history" },
+  { name: "/add", description: "Add a file to persistent context" },
+  { name: "/context", description: "List persistent context files" },
+  { name: "/clear-context", description: "Clear persistent context files" },
+  { name: "/quit", description: "Exit" },
+  { name: "/exit", description: "Exit" },
+];
 
 const colors = {
   cyan: "\x1b[36m",
@@ -42,6 +54,7 @@ Options:
   --base-url URL               OpenAI-compatible API base URL
   --timeout SECONDS            Request timeout. Default: ${DEFAULT_TIMEOUT_SECONDS}
   --no-tools                   Disable local file and command tools
+  --no-agents                  Do not auto-load AGENTS.md instructions
   --version                    Show version
   -h, --help                   Show help
 
@@ -176,6 +189,8 @@ function parseArgs(argv) {
       args.timeout = Number(arg.slice("--timeout=".length));
     } else if (arg === "--no-tools") {
       args.noTools = true;
+    } else if (arg === "--no-agents") {
+      args.noAgents = true;
     } else if (arg.startsWith("-")) {
       throw new Error(`Unknown option: ${arg}`);
     } else {
@@ -329,15 +344,36 @@ function resolveApiKey({ shellApiKey, credentialsFile, envFile }) {
   };
 }
 
-function makeSystemPrompt(cwd) {
+function formatAgentsInstructions(agentFiles, cwd) {
+  if (!agentFiles.length) {
+    return "";
+  }
+
+  const blocks = agentFiles.map((agentFile) => {
+    const display = relativeOrAbsolute(agentFile.path, cwd);
+    return `<agents path="${display}">\n${agentFile.content}\n</agents>`;
+  });
+
   return [
+    "以下はこのワークスペースのAGENTS.mdから読み込んだ作業指示です。矛盾がある場合は、より下位ディレクトリに近いAGENTS.mdの指示を優先してください。",
+    ...blocks,
+  ].join("\n\n");
+}
+
+function makeSystemPrompt(cwd, agentFiles = []) {
+  const base = [
     "あなたはCodex CLIのように、ターミナル上で開発を支援する実用的なAIアシスタントです。",
     "ユーザーはローカルのプロジェクトで作業しています。必要なファイル作成、編集、検証コマンド実行は利用可能なツールで自分で行ってください。",
     "実装を依頼されたら、原則として確認待ちで止まらず、合理的な仮定を置いて作業を完了してください。",
     "ユーザーにコマンド実行やファイル作成を依頼するだけで終わらないでください。あなた自身がツールを呼び出して作業してください。",
     "作業後は、変更内容と検証結果を簡潔に報告してください。",
     `現在の作業ディレクトリ: ${cwd}`,
-  ].join("\n");
+  ];
+  const agents = formatAgentsInstructions(agentFiles, cwd);
+  if (agents) {
+    base.push(agents);
+  }
+  return base.join("\n\n");
 }
 
 function expandHome(rawPath) {
@@ -375,6 +411,28 @@ function readTextFile(filePath) {
     text += `\n\n[truncated after ${MAX_FILE_BYTES} bytes]`;
   }
   return text;
+}
+
+function findAgentsFiles(cwd) {
+  const dirs = [];
+  let current = cwd;
+  while (true) {
+    dirs.push(current);
+    const parent = path.dirname(current);
+    if (parent === current) {
+      break;
+    }
+    current = parent;
+  }
+
+  return dirs
+    .reverse()
+    .map((dir) => path.join(dir, "AGENTS.md"))
+    .filter((candidate) => fs.existsSync(candidate) && fs.statSync(candidate).isFile())
+    .map((candidate) => ({
+      path: candidate,
+      content: readTextFile(candidate),
+    }));
 }
 
 function relativeOrAbsolute(filePath, cwd) {
@@ -434,6 +492,7 @@ function printBanner(state) {
   console.log(`│ cwd: ${color("green", state.cwd)}`);
   console.log(`│ credentials: ${color("dim", credentialLabel)}`);
   console.log(`│ tools: ${state.toolsEnabled ? color("green", "enabled") : color("dim", "disabled")}`);
+  console.log(`│ AGENTS.md: ${state.agentFiles.length ? color("green", `${state.agentFiles.length} loaded`) : color("dim", "none")}`);
   console.log("│");
   console.log(`│ Type ${color("bold", "/help")} for commands, ${color("bold", "/quit")} to exit.`);
   console.log(color("cyan", "╰───────────────────────────────────────────────────╯"));
@@ -453,15 +512,141 @@ function printHelp() {
 You can also attach a file once with @path/to/file in your prompt.`);
 }
 
+function getSlashSuggestions(buffer) {
+  if (!buffer.startsWith("/") || /\s/.test(buffer)) {
+    return [];
+  }
+  return SLASH_COMMANDS
+    .filter((command) => command.name.startsWith(buffer))
+    .slice(0, 8);
+}
+
+function renderPromptLine(buffer, previousSuggestionLines) {
+  cursorTo(output, 0);
+  clearLine(output, 0);
+  for (let i = 0; i < previousSuggestionLines; i += 1) {
+    moveCursor(output, 0, 1);
+    clearLine(output, 0);
+  }
+  if (previousSuggestionLines) {
+    moveCursor(output, 0, -previousSuggestionLines);
+  }
+
+  const suggestions = getSlashSuggestions(buffer);
+  cursorTo(output, 0);
+  output.write(`› ${buffer}`);
+  for (const suggestion of suggestions) {
+    output.write(`\n  ${color("cyan", suggestion.name.padEnd(16))} ${color("dim", suggestion.description)}`);
+  }
+  if (suggestions.length) {
+    moveCursor(output, 0, -suggestions.length);
+    cursorTo(output, 2 + buffer.length);
+  }
+  return suggestions.length;
+}
+
+function readPromptLine() {
+  if (!input.isTTY || !output.isTTY) {
+    const rl = readlinePromises.createInterface({ input, output });
+    return rl.question("\n› ").finally(() => rl.close());
+  }
+
+  return new Promise((resolve) => {
+    let buffer = "";
+    let suggestionLines = 0;
+    const wasRaw = Boolean(input.isRaw);
+
+    output.write("\n");
+    input.setRawMode(true);
+    input.resume();
+    suggestionLines = renderPromptLine(buffer, suggestionLines);
+
+    function finish(value) {
+      input.off("data", onData);
+      input.setRawMode(wasRaw);
+      input.pause();
+      cursorTo(output, 0);
+      clearLine(output, 0);
+      for (let i = 0; i < suggestionLines; i += 1) {
+        moveCursor(output, 0, 1);
+        clearLine(output, 0);
+      }
+      if (suggestionLines) {
+        moveCursor(output, 0, -suggestionLines);
+      }
+      cursorTo(output, 0);
+      output.write(`› ${buffer}\n`);
+      resolve(value);
+    }
+
+    function redraw() {
+      suggestionLines = renderPromptLine(buffer, suggestionLines);
+    }
+
+    function handleCharacter(char) {
+      if (char === "\u0003") {
+        finish(null);
+        return false;
+      }
+      if (char === "\r" || char === "\n") {
+        finish(buffer);
+        return false;
+      }
+      if (char === "\u007f" || char === "\b") {
+        buffer = buffer.slice(0, -1);
+        redraw();
+        return true;
+      }
+      if (char === "\u0015") {
+        buffer = "";
+        redraw();
+        return true;
+      }
+      if (char === "\t") {
+        const suggestions = getSlashSuggestions(buffer);
+        if (suggestions.length === 1) {
+          buffer = `${suggestions[0].name} `;
+          redraw();
+        }
+        return true;
+      }
+      if (char >= " " && char !== "\u007f") {
+        buffer += char;
+        redraw();
+      }
+      return true;
+    }
+
+    function onData(chunk) {
+      const value = chunk.toString("utf8");
+      if (value.startsWith("\u001b")) {
+        return;
+      }
+      for (const char of value) {
+        if (!handleCharacter(char)) {
+          break;
+        }
+      }
+    }
+
+    input.on("data", onData);
+  });
+}
+
 function printStatus(state) {
   const context = state.contextFiles.length
     ? state.contextFiles.map((filePath) => `- ${filePath}`).join("\n")
+    : "(none)";
+  const agents = state.agentFiles.length
+    ? state.agentFiles.map((agentFile) => `- ${agentFile.path}`).join("\n")
     : "(none)";
 console.log(`model: ${state.model}
 base_url: ${state.baseUrl}
 cwd: ${state.cwd}
 credentials: ${state.apiKeySource || "(none)"}
 tools: ${state.toolsEnabled ? "enabled" : "disabled"}
+AGENTS.md:
+${agents}
 messages: ${state.messages.length}
 context files:
 ${context}`);
@@ -977,33 +1162,32 @@ async function agentResponse(state, userPrompt) {
 }
 
 async function repl(state) {
-  const rl = readline.createInterface({ input, output });
-  try {
-    while (true) {
-      const line = (await rl.question("\n› ")).trim();
-      if (!line) {
-        continue;
-      }
-      if (line.startsWith("/")) {
-        const result = handleCommand(line, state);
-        if (result === "quit") {
-          return 0;
-        }
-        continue;
-      }
-
-      try {
-        if (state.toolsEnabled) {
-          await agentResponse(state, line);
-        } else {
-          await streamResponse(state, line);
-        }
-      } catch (error) {
-        console.error(color("red", `Error: ${error.message}`));
-      }
+  while (true) {
+    const inputLine = await readPromptLine();
+    if (inputLine === null) {
+      return 0;
     }
-  } finally {
-    rl.close();
+    const line = inputLine.trim();
+    if (!line) {
+      continue;
+    }
+    if (line.startsWith("/")) {
+      const result = handleCommand(line, state);
+      if (result === "quit") {
+        return 0;
+      }
+      continue;
+    }
+
+    try {
+      if (state.toolsEnabled) {
+        await agentResponse(state, line);
+      } else {
+        await streamResponse(state, line);
+      }
+    } catch (error) {
+      console.error(color("red", `Error: ${error.message}`));
+    }
   }
 }
 
@@ -1036,6 +1220,7 @@ async function main() {
   const credentialsFile = findCredentialsFile();
   const envFile = findEnvFile(cwd);
   loadEnvFile(envFile);
+  const agentFiles = args.noAgents ? [] : findAgentsFiles(cwd);
 
   let apiKeyInfo;
   try {
@@ -1063,8 +1248,9 @@ async function main() {
     timeout: args.timeout,
     toolsEnabled: !args.noTools,
     cwd,
+    agentFiles,
     contextFiles: [],
-    systemPrompt: makeSystemPrompt(cwd),
+    systemPrompt: makeSystemPrompt(cwd, agentFiles),
     messages: [],
   };
   resetMessages(state);
