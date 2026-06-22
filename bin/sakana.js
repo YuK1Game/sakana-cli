@@ -3,12 +3,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { createHash, randomUUID } from "node:crypto";
 import readlinePromises from "node:readline/promises";
 import { clearLine, cursorTo, moveCursor } from "node:readline";
 import { spawn } from "node:child_process";
 import { stdin as input, stdout as output } from "node:process";
 
-const VERSION = "0.9.0";
+const VERSION = "0.10.0";
 const DEFAULT_BASE_URL = "https://api.sakana.ai/v1";
 const DEFAULT_MODEL = "fugu";
 const DEFAULT_UPDATE_SOURCE = "github:YuK1Game/sakana-cli#main";
@@ -20,6 +21,7 @@ const MAX_AGENT_TURNS = 20;
 const ATTACHMENT_RE = /(?<!\S)@([^\s]+)/g;
 const SLASH_COMMANDS = [
   { name: "/help", description: "Show command list" },
+  { name: "/init", description: "Create AGENTS.md in the current workspace" },
   { name: "/status", description: "Show current settings" },
   { name: "/model", description: "Switch model: fugu or fugu-ultra" },
   { name: "/reset", description: "Clear conversation history" },
@@ -48,6 +50,7 @@ function usage() {
 
 Usage:
   sakana [options] [prompt...]
+  sakana resume [options] [prompt...]
   sakana update [--source SOURCE] [--dry-run]
 
 Options:
@@ -55,6 +58,7 @@ Options:
   --base-url URL               OpenAI-compatible API base URL
   --timeout SECONDS            Request timeout. Default: ${DEFAULT_TIMEOUT_SECONDS}
   --retries COUNT              Retries for temporary API failures. Default: ${DEFAULT_RETRIES}
+  --session ID                 Resume a specific saved session
   --no-tools                   Disable local file and command tools
   --no-agents                  Do not auto-load AGENTS.md instructions
   --version                    Show version
@@ -62,6 +66,7 @@ Options:
 
 Interactive commands:
   /help            Show command list
+  /init            Create AGENTS.md in the current workspace
   /status          Show current model, cwd, and context files
   /model NAME      Switch model: fugu or fugu-ultra
   /reset           Clear conversation history
@@ -180,12 +185,16 @@ function parseArgs(argv) {
       args.version = true;
     } else if (arg === "--model") {
       args.model = argv[++i];
+      args.modelSpecified = true;
     } else if (arg.startsWith("--model=")) {
       args.model = arg.slice("--model=".length);
+      args.modelSpecified = true;
     } else if (arg === "--base-url") {
       args.baseUrl = argv[++i];
+      args.baseUrlSpecified = true;
     } else if (arg.startsWith("--base-url=")) {
       args.baseUrl = arg.slice("--base-url=".length);
+      args.baseUrlSpecified = true;
     } else if (arg === "--timeout") {
       args.timeout = Number(argv[++i]);
     } else if (arg.startsWith("--timeout=")) {
@@ -194,6 +203,10 @@ function parseArgs(argv) {
       args.retries = Number(argv[++i]);
     } else if (arg.startsWith("--retries=")) {
       args.retries = Number(arg.slice("--retries=".length));
+    } else if (arg === "--session") {
+      args.sessionId = argv[++i];
+    } else if (arg.startsWith("--session=")) {
+      args.sessionId = arg.slice("--session=".length);
     } else if (arg === "--no-tools") {
       args.noTools = true;
     } else if (arg === "--no-agents") {
@@ -281,6 +294,94 @@ function findCredentialsFile() {
     return path.resolve(expandHome(configured));
   }
   return path.join(os.homedir(), ".sakana", "credentials");
+}
+
+function getSessionsDir() {
+  return path.join(os.homedir(), ".sakana", "sessions");
+}
+
+function createSessionId(cwd) {
+  const timestamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
+  const cwdHash = createHash("sha256").update(cwd).digest("hex").slice(0, 8);
+  return `${timestamp}-${cwdHash}-${randomUUID().slice(0, 8)}`;
+}
+
+function sessionPathForId(sessionId) {
+  if (!/^[A-Za-z0-9_.-]+$/.test(sessionId)) {
+    throw new Error(`Invalid session id: ${sessionId}`);
+  }
+  return path.join(getSessionsDir(), `${sessionId}.json`);
+}
+
+function readSessionFile(filePath) {
+  return JSON.parse(fs.readFileSync(filePath, "utf8"));
+}
+
+function listSessionFiles() {
+  const sessionsDir = getSessionsDir();
+  if (!fs.existsSync(sessionsDir)) {
+    return [];
+  }
+  return fs.readdirSync(sessionsDir)
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => path.join(sessionsDir, name));
+}
+
+function findLatestSession(cwd) {
+  const sessions = [];
+  for (const filePath of listSessionFiles()) {
+    try {
+      const session = readSessionFile(filePath);
+      if (session.cwd === cwd) {
+        sessions.push({ ...session, filePath });
+      }
+    } catch {
+      // Ignore malformed session files.
+    }
+  }
+  sessions.sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
+  return sessions[0] || null;
+}
+
+function saveSession(state) {
+  if (!state.sessionId) {
+    return;
+  }
+  const sessionsDir = getSessionsDir();
+  fs.mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
+  const session = {
+    version: 1,
+    id: state.sessionId,
+    cwd: state.cwd,
+    createdAt: state.sessionCreatedAt,
+    updatedAt: new Date().toISOString(),
+    model: state.model,
+    baseUrl: state.baseUrl,
+    toolsEnabled: state.toolsEnabled,
+    agentFiles: state.agentFiles.map((agentFile) => agentFile.path),
+    contextFiles: state.contextFiles,
+    messages: state.messages,
+  };
+  const filePath = state.sessionPath || sessionPathForId(state.sessionId);
+  const tmpPath = `${filePath}.tmp`;
+  fs.writeFileSync(tmpPath, `${JSON.stringify(session, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(tmpPath, filePath);
+  state.sessionPath = filePath;
+}
+
+function loadSession({ cwd, sessionId }) {
+  if (sessionId) {
+    const filePath = sessionPathForId(sessionId);
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
+    return { ...readSessionFile(filePath), filePath };
+  }
+  const latest = findLatestSession(cwd);
+  if (!latest) {
+    throw new Error(`No saved session found for ${cwd}`);
+  }
+  return latest;
 }
 
 function parseCredentialsContent(content) {
@@ -384,6 +485,24 @@ function makeSystemPrompt(cwd, agentFiles = []) {
     base.push(agents);
   }
   return base.join("\n\n");
+}
+
+function defaultAgentsContent() {
+  return `# AGENTS.md
+
+## Project Instructions
+
+- Work in the current repository unless the user explicitly asks otherwise.
+- Prefer small, focused changes that match the existing project style.
+- Read relevant files before editing.
+- Run available checks after changes when practical.
+- Do not expose secrets or API keys.
+
+## Sakana CLI
+
+- Use local tools to inspect, edit, and verify files.
+- Summarize changes and verification results at the end of the task.
+`;
 }
 
 function expandHome(rawPath) {
@@ -498,6 +617,7 @@ function printBanner(state) {
   const credentialLabel = state.apiKeySource || "not found";
   console.log(color("cyan", "╭───────────────────────────────────────────────────╮"));
   console.log(`│ ${color("bold", "Sakana CLI")} ${color("dim", `v${VERSION}`)}`);
+  console.log(`│ session: ${color("dim", state.sessionId)}`);
   console.log(`│ model: ${color("cyan", state.model)}`);
   console.log(`│ cwd: ${color("green", state.cwd)}`);
   console.log(`│ credentials: ${color("dim", credentialLabel)}`);
@@ -512,6 +632,7 @@ function printBanner(state) {
 function printHelp() {
   console.log(`Commands
 /help            Show this help
+/init            Create AGENTS.md in the current workspace
 /status          Show current model, cwd, and context files
 /model NAME      Switch model: fugu or fugu-ultra
 /reset           Clear conversation history
@@ -652,6 +773,7 @@ function printStatus(state) {
     ? state.agentFiles.map((agentFile) => `- ${agentFile.path}`).join("\n")
     : "(none)";
 console.log(`model: ${state.model}
+session: ${state.sessionId}
 base_url: ${state.baseUrl}
 cwd: ${state.cwd}
 credentials: ${state.apiKeySource || "(none)"}
@@ -994,12 +1116,29 @@ function handleCommand(line, state) {
     printHelp();
     return "handled";
   }
+  if (command === "/init") {
+    const agentsPath = path.join(state.cwd, "AGENTS.md");
+    if (fs.existsSync(agentsPath)) {
+      console.log(color("dim", `AGENTS.md already exists: ${agentsPath}`));
+      return "handled";
+    }
+    fs.writeFileSync(agentsPath, defaultAgentsContent(), { mode: 0o644 });
+    state.agentFiles = findAgentsFiles(state.cwd);
+    state.systemPrompt = makeSystemPrompt(state.cwd, state.agentFiles);
+    if (state.messages[0]?.role === "system") {
+      state.messages[0].content = state.systemPrompt;
+    }
+    saveSession(state);
+    console.log(color("green", `Created ${agentsPath}`));
+    return "handled";
+  }
   if (command === "/status") {
     printStatus(state);
     return "handled";
   }
   if (command === "/reset") {
     resetMessages(state);
+    saveSession(state);
     console.log(color("green", "Conversation history cleared."));
     return "handled";
   }
@@ -1009,6 +1148,7 @@ function handleCommand(line, state) {
       return "handled";
     }
     state.model = arg;
+    saveSession(state);
     console.log(color("green", `Model switched to ${arg}.`));
     return "handled";
   }
@@ -1027,6 +1167,7 @@ function handleCommand(line, state) {
     if (!state.contextFiles.includes(filePath)) {
       state.contextFiles.push(filePath);
     }
+    saveSession(state);
     console.log(`${color("green", "Added context:")} ${filePath}`);
     return "handled";
   }
@@ -1040,6 +1181,7 @@ function handleCommand(line, state) {
   }
   if (command === "/clear-context") {
     state.contextFiles = [];
+    saveSession(state);
     console.log(color("green", "Context cleared."));
     return "handled";
   }
@@ -1115,6 +1257,7 @@ function parseStreamLine(line) {
 async function streamResponse(state, userPrompt) {
   const userMessage = buildUserMessage(userPrompt, state);
   state.messages.push({ role: "user", content: userMessage });
+  saveSession(state);
 
   const chunks = [];
 
@@ -1157,17 +1300,20 @@ async function streamResponse(state, userPrompt) {
     process.stdout.write("\n");
   } catch (error) {
     state.messages.pop();
+    saveSession(state);
     throw new Error(describeError(error, state, "Chat request"));
   }
 
   const answer = chunks.join("");
   state.messages.push({ role: "assistant", content: answer });
+  saveSession(state);
   return answer;
 }
 
 async function agentResponse(state, userPrompt) {
   const userMessage = buildUserMessage(userPrompt, state);
   state.messages.push({ role: "user", content: userMessage });
+  saveSession(state);
 
   for (let turn = 0; turn < MAX_AGENT_TURNS; turn += 1) {
     let completion;
@@ -1192,6 +1338,7 @@ async function agentResponse(state, userPrompt) {
       content: message.content || "",
       ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
     });
+    saveSession(state);
 
     if (!toolCalls.length) {
       const answer = message.content || "";
@@ -1216,6 +1363,7 @@ async function agentResponse(state, userPrompt) {
         tool_call_id: toolCall.id,
         content: String(result),
       });
+      saveSession(state);
     }
   }
 
@@ -1253,9 +1401,13 @@ async function repl(state) {
 }
 
 async function main() {
-  const argv = process.argv.slice(2);
+  let argv = process.argv.slice(2);
   if (argv[0] === "update") {
     return runUpdate(argv.slice(1));
+  }
+  const resumeMode = argv[0] === "resume";
+  if (resumeMode) {
+    argv = argv.slice(1);
   }
 
   let args;
@@ -1282,6 +1434,15 @@ async function main() {
   const envFile = findEnvFile(cwd);
   loadEnvFile(envFile);
   const agentFiles = args.noAgents ? [] : findAgentsFiles(cwd);
+  let loadedSession = null;
+  if (resumeMode) {
+    try {
+      loadedSession = loadSession({ cwd, sessionId: args.sessionId });
+    } catch (error) {
+      console.error(color("red", error.message));
+      return 1;
+    }
+  }
 
   let apiKeyInfo;
   try {
@@ -1301,21 +1462,35 @@ async function main() {
     return 1;
   }
 
+  const sessionId = loadedSession?.id || createSessionId(cwd);
   const state = {
+    sessionId,
+    sessionPath: loadedSession?.filePath || sessionPathForId(sessionId),
+    sessionCreatedAt: loadedSession?.createdAt || new Date().toISOString(),
     apiKey: apiKeyInfo.apiKey,
     apiKeySource: apiKeyInfo.source,
-    model: args.model,
-    baseUrl: args.baseUrl,
+    model: args.modelSpecified ? args.model : (loadedSession?.model || args.model),
+    baseUrl: args.baseUrlSpecified ? args.baseUrl : (loadedSession?.baseUrl || args.baseUrl),
     timeout: args.timeout,
     retries: args.retries,
-    toolsEnabled: !args.noTools,
+    toolsEnabled: args.noTools ? false : (loadedSession?.toolsEnabled ?? true),
     cwd,
     agentFiles,
-    contextFiles: [],
+    contextFiles: loadedSession?.contextFiles || [],
     systemPrompt: makeSystemPrompt(cwd, agentFiles),
-    messages: [],
+    messages: loadedSession?.messages || [],
   };
-  resetMessages(state);
+  if (state.messages.length) {
+    if (state.messages[0]?.role === "system") {
+      state.messages[0].content = state.systemPrompt;
+    } else {
+      state.messages.unshift({ role: "system", content: state.systemPrompt });
+    }
+    console.log(color("dim", `Resumed session ${state.sessionId} (${state.messages.length} message(s))`));
+  } else {
+    resetMessages(state);
+  }
+  saveSession(state);
 
   const prompt = args.prompt.join(" ").trim();
   if (prompt) {

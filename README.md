@@ -77,6 +77,18 @@ sakana --model fugu-ultra
 sakana "このプロジェクトの実装方針を整理して"
 ```
 
+会話は `~/.sakana/sessions` に自動保存されます。現在の作業ディレクトリの最新セッションを再開する場合:
+
+```bash
+sakana resume
+```
+
+特定のセッションIDを再開する場合:
+
+```bash
+sakana resume --session 20260622143000-abcd1234-ef567890
+```
+
 デフォルトではローカルツールが有効です。モデルは必要に応じて、現在の作業ディレクトリ内でファイル一覧取得、ファイル読み取り、ファイル作成・上書き、コマンド実行を行います。
 
 起動時には、現在の作業ディレクトリから親方向に `AGENTS.md` を探索して自動で読み込みます。複数見つかった場合は親ディレクトリから順に読み込み、より作業ディレクトリに近い `AGENTS.md` の指示を優先します。
@@ -133,6 +145,7 @@ sakana update --dry-run
 
 ```text
 /help            コマンド一覧
+/init            AGENTS.mdを作成
 /status          現在の設定
 /model NAME      モデル変更: fugu または fugu-ultra
 /reset           会話履歴をクリア
