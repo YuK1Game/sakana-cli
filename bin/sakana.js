@@ -7,10 +7,11 @@ import readline from "node:readline/promises";
 import { spawn } from "node:child_process";
 import { stdin as input, stdout as output } from "node:process";
 
-const VERSION = "0.5.0";
+const VERSION = "0.6.0";
 const DEFAULT_BASE_URL = "https://api.sakana.ai/v1";
 const DEFAULT_MODEL = "fugu";
 const DEFAULT_UPDATE_SOURCE = "github:YuK1Game/sakana-cli#main";
+const DEFAULT_TIMEOUT_SECONDS = 300;
 const MAX_FILE_BYTES = 40_000;
 const MAX_COMMAND_OUTPUT_BYTES = 30_000;
 const MAX_AGENT_TURNS = 20;
@@ -39,7 +40,7 @@ Usage:
 Options:
   --model fugu|fugu-ultra      Model to use
   --base-url URL               OpenAI-compatible API base URL
-  --timeout SECONDS            Request timeout
+  --timeout SECONDS            Request timeout. Default: ${DEFAULT_TIMEOUT_SECONDS}
   --no-tools                   Disable local file and command tools
   --version                    Show version
   -h, --help                   Show help
@@ -151,7 +152,7 @@ function parseArgs(argv) {
   const args = {
     model: process.env.SAKANA_MODEL || DEFAULT_MODEL,
     baseUrl: process.env.SAKANA_BASE_URL || DEFAULT_BASE_URL,
-    timeout: Number(process.env.SAKANA_TIMEOUT || "120"),
+    timeout: Number(process.env.SAKANA_TIMEOUT || String(DEFAULT_TIMEOUT_SECONDS)),
     prompt: [],
   };
 
@@ -558,6 +559,64 @@ function truncateOutput(text, maxBytes = MAX_COMMAND_OUTPUT_BYTES) {
   return `${data.subarray(0, maxBytes).toString("utf8")}\n[truncated after ${maxBytes} bytes]`;
 }
 
+function truncateDisplay(text, maxLength = 120) {
+  const value = String(text ?? "");
+  if (value.length <= maxLength) {
+    return value;
+  }
+  return `${value.slice(0, maxLength - 1)}…`;
+}
+
+function quoteDisplay(text) {
+  return JSON.stringify(truncateDisplay(text));
+}
+
+function summarizeToolCall(name, args, state) {
+  if (name === "list_files") {
+    return `path=${quoteDisplay(args.path || ".")} max_depth=${args.max_depth ?? 2}`;
+  }
+  if (name === "read_file") {
+    return `path=${quoteDisplay(args.path)}`;
+  }
+  if (name === "write_file") {
+    const bytes = Buffer.byteLength(args.content || "", "utf8");
+    return `path=${quoteDisplay(args.path)} bytes=${bytes}`;
+  }
+  if (name === "run_command") {
+    return `command=${quoteDisplay(args.command)} timeout=${args.timeout_seconds ?? 60}s cwd=${quoteDisplay(state.cwd)}`;
+  }
+  return "";
+}
+
+function summarizeToolResult(name, result) {
+  if (name === "run_command") {
+    try {
+      const parsed = JSON.parse(result);
+      const stderr = parsed.stderr ? ` stderr=${Buffer.byteLength(parsed.stderr, "utf8")}B` : "";
+      const stdout = parsed.stdout ? ` stdout=${Buffer.byteLength(parsed.stdout, "utf8")}B` : "";
+      const signal = parsed.signal ? ` signal=${parsed.signal}` : "";
+      return `exit_code=${parsed.exit_code}${signal}${stdout}${stderr}`;
+    } catch {
+      return truncateDisplay(result);
+    }
+  }
+  if (name === "list_files") {
+    const count = result && result !== "(empty)" ? String(result).split("\n").length : 0;
+    return `${count} item(s)`;
+  }
+  if (name === "read_file") {
+    return `${Buffer.byteLength(result || "", "utf8")} bytes`;
+  }
+  return truncateDisplay(result);
+}
+
+function describeError(error, state, context) {
+  if (error?.name === "AbortError") {
+    return `${context} timed out after ${state.timeout}s. Try continuing, or start sakana with --timeout ${Math.max(state.timeout * 2, DEFAULT_TIMEOUT_SECONDS)}.`;
+  }
+  return error?.message || String(error);
+}
+
 function listFilesTool(args, state) {
   const start = resolvePath(args.path || ".", state.cwd);
   assertInsideCwd(start, state.cwd);
@@ -652,21 +711,24 @@ function runCommandTool(args, state) {
 async function executeToolCall(toolCall, state) {
   const name = toolCall.function?.name;
   const args = parseToolArguments(toolCall.function?.arguments || "{}");
-  console.log(color("dim", `tool: ${name}`));
+  console.log(color("dim", `tool: ${name} ${summarizeToolCall(name, args, state)}`.trim()));
+
+  let result;
 
   if (name === "list_files") {
-    return listFilesTool(args, state);
+    result = listFilesTool(args, state);
+  } else if (name === "read_file") {
+    result = readFileTool(args, state);
+  } else if (name === "write_file") {
+    result = writeFileTool(args, state);
+  } else if (name === "run_command") {
+    result = await runCommandTool(args, state);
+  } else {
+    throw new Error(`Unknown tool: ${name}`);
   }
-  if (name === "read_file") {
-    return readFileTool(args, state);
-  }
-  if (name === "write_file") {
-    return writeFileTool(args, state);
-  }
-  if (name === "run_command") {
-    return runCommandTool(args, state);
-  }
-  throw new Error(`Unknown tool: ${name}`);
+
+  console.log(color("dim", `ok: ${name} ${summarizeToolResult(name, result)}`.trim()));
+  return result;
 }
 
 function handleCommand(line, state) {
@@ -845,7 +907,7 @@ async function streamResponse(state, userPrompt) {
     process.stdout.write("\n");
   } catch (error) {
     state.messages.pop();
-    throw error;
+    throw new Error(describeError(error, state, "Chat request"));
   } finally {
     clearTimeout(timer);
   }
@@ -865,7 +927,10 @@ async function agentResponse(state, userPrompt) {
     let completion;
 
     try {
+      console.log(color("dim", `agent: turn ${turn + 1}/${MAX_AGENT_TURNS} waiting for ${state.model}...`));
       completion = await postAgentCompletion(state, controller.signal);
+    } catch (error) {
+      throw new Error(describeError(error, state, "Agent request"));
     } finally {
       clearTimeout(timer);
     }
@@ -891,12 +956,14 @@ async function agentResponse(state, userPrompt) {
       return answer;
     }
 
+    console.log(color("dim", `agent: ${toolCalls.length} tool call(s) requested`));
     for (const toolCall of toolCalls) {
       let result;
       try {
         result = await executeToolCall(toolCall, state);
       } catch (error) {
         result = `Tool error: ${error.message}`;
+        console.error(color("red", result));
       }
       state.messages.push({
         role: "tool",

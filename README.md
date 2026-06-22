@@ -79,6 +79,23 @@ sakana "このプロジェクトの実装方針を整理して"
 
 デフォルトではローカルツールが有効です。モデルは必要に応じて、現在の作業ディレクトリ内でファイル一覧取得、ファイル読み取り、ファイル作成・上書き、コマンド実行を行います。
 
+作業中は次のように進行状況を表示します。
+
+```text
+agent: turn 1/20 waiting for fugu-ultra...
+agent: 2 tool call(s) requested
+tool: write_file path="src/main.ts" bytes=1234
+ok: write_file wrote src/main.ts (1234 bytes)
+tool: run_command command="npm run build" timeout=60s cwd="/path/to/project"
+ok: run_command exit_code=0 stdout=2048B
+```
+
+長い作業でタイムアウトする場合:
+
+```bash
+sakana --timeout 600
+```
+
 従来のチャットのみで使う場合:
 
 ```bash
