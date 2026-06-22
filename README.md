@@ -36,17 +36,38 @@ npm link
 
 ## API Key
 
-カレントディレクトリまたは親ディレクトリの `.env` から `SAKANA_API_KEY` を読みます。
+標準では `~/.sakana/credentials` からAPIキーを読みます。
+
+```bash
+mkdir -p ~/.sakana
+chmod 700 ~/.sakana
+printf 'SAKANA_API_KEY=your_api_key_here\n' > ~/.sakana/credentials
+chmod 600 ~/.sakana/credentials
+```
+
+次の形式も使えます。
 
 ```env
 SAKANA_API_KEY=...
 ```
 
-シェル環境変数でも使えます。
+```text
+your_api_key_here
+```
+
+シェル環境変数 `SAKANA_API_KEY` は credentials より優先されます。
 
 ```bash
 export SAKANA_API_KEY=...
 ```
+
+credentials の場所を変えたい場合:
+
+```bash
+export SAKANA_CREDENTIALS_FILE=/path/to/credentials
+```
+
+互換性のため、credentials がない場合はカレントディレクトリまたは親ディレクトリの `.env` も fallback として読みます。
 
 ## Usage
 

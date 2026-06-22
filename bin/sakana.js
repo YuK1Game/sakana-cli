@@ -7,7 +7,7 @@ import readline from "node:readline/promises";
 import { spawn } from "node:child_process";
 import { stdin as input, stdout as output } from "node:process";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const DEFAULT_BASE_URL = "https://api.sakana.ai/v1";
 const DEFAULT_MODEL = "fugu";
 const DEFAULT_UPDATE_SOURCE = "github:YuK1Game/sakana-cli#main";
@@ -244,6 +244,85 @@ function loadEnvFile(envFile) {
   }
 }
 
+function findCredentialsFile() {
+  const configured = process.env.SAKANA_CREDENTIALS_FILE;
+  if (configured) {
+    return path.resolve(expandHome(configured));
+  }
+  return path.join(os.homedir(), ".sakana", "credentials");
+}
+
+function parseCredentialsContent(content) {
+  const trimmed = content.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  if (trimmed.startsWith("{")) {
+    const parsed = JSON.parse(trimmed);
+    return parsed.SAKANA_API_KEY || parsed.api_key || parsed.apiKey || "";
+  }
+
+  for (const line of content.split(/\r?\n/)) {
+    const parsed = parseEnvLine(line);
+    if (!parsed) {
+      continue;
+    }
+    const [key, value] = parsed;
+    if (["SAKANA_API_KEY", "api_key", "apiKey"].includes(key)) {
+      return value;
+    }
+  }
+
+  for (const line of content.split(/\r?\n/)) {
+    const raw = line.trim();
+    if (raw && !raw.startsWith("#")) {
+      return raw;
+    }
+  }
+  return "";
+}
+
+function readCredentialsFile(credentialsFile) {
+  if (!fs.existsSync(credentialsFile)) {
+    return "";
+  }
+  return parseCredentialsContent(fs.readFileSync(credentialsFile, "utf8"));
+}
+
+function resolveApiKey({ shellApiKey, credentialsFile, envFile }) {
+  if (shellApiKey) {
+    return {
+      apiKey: shellApiKey,
+      source: "environment variable SAKANA_API_KEY",
+    };
+  }
+
+  try {
+    const credentialsApiKey = readCredentialsFile(credentialsFile);
+    if (credentialsApiKey) {
+      return {
+        apiKey: credentialsApiKey,
+        source: credentialsFile,
+      };
+    }
+  } catch (error) {
+    throw new Error(`Could not read ${credentialsFile}: ${error.message}`);
+  }
+
+  if (process.env.SAKANA_API_KEY) {
+    return {
+      apiKey: process.env.SAKANA_API_KEY,
+      source: envFile ? `.env: ${envFile}` : "environment variable SAKANA_API_KEY",
+    };
+  }
+
+  return {
+    apiKey: "",
+    source: "",
+  };
+}
+
 function makeSystemPrompt(cwd) {
   return [
     "あなたはCodex CLIのように、ターミナル上で開発を支援する実用的なAIアシスタントです。",
@@ -333,13 +412,13 @@ function resetMessages(state) {
   state.messages = [{ role: "system", content: state.systemPrompt }];
 }
 
-function printBanner(state, envFile) {
-  const envLabel = envFile || "not found";
+function printBanner(state) {
+  const credentialLabel = state.apiKeySource || "not found";
   console.log(color("cyan", "╭───────────────────────────────────────────────────╮"));
   console.log(`│ ${color("bold", "Sakana CLI")} ${color("dim", `v${VERSION}`)}`);
   console.log(`│ model: ${color("cyan", state.model)}`);
   console.log(`│ cwd: ${color("green", state.cwd)}`);
-  console.log(`│ .env: ${color("dim", envLabel)}`);
+  console.log(`│ credentials: ${color("dim", credentialLabel)}`);
   console.log("│");
   console.log(`│ Type ${color("bold", "/help")} for commands, ${color("bold", "/quit")} to exit.`);
   console.log(color("cyan", "╰───────────────────────────────────────────────────╯"));
@@ -363,9 +442,10 @@ function printStatus(state) {
   const context = state.contextFiles.length
     ? state.contextFiles.map((filePath) => `- ${filePath}`).join("\n")
     : "(none)";
-  console.log(`model: ${state.model}
+console.log(`model: ${state.model}
 base_url: ${state.baseUrl}
 cwd: ${state.cwd}
+credentials: ${state.apiKeySource || "(none)"}
 messages: ${state.messages.length}
 context files:
 ${context}`);
@@ -580,17 +660,32 @@ async function main() {
   }
 
   const cwd = process.cwd();
+  const shellApiKey = process.env.SAKANA_API_KEY;
+  const credentialsFile = findCredentialsFile();
   const envFile = findEnvFile(cwd);
   loadEnvFile(envFile);
 
-  const apiKey = process.env.SAKANA_API_KEY;
-  if (!apiKey) {
-    console.error(color("red", "SAKANA_API_KEY is not set. Put it in .env or export it in your shell."));
+  let apiKeyInfo;
+  try {
+    apiKeyInfo = resolveApiKey({ shellApiKey, credentialsFile, envFile });
+  } catch (error) {
+    console.error(color("red", error.message));
+    return 1;
+  }
+
+  if (!apiKeyInfo.apiKey) {
+    console.error(
+      color(
+        "red",
+        `SAKANA_API_KEY is not set. Put it in ${credentialsFile} or export it in your shell.`,
+      ),
+    );
     return 1;
   }
 
   const state = {
-    apiKey,
+    apiKey: apiKeyInfo.apiKey,
+    apiKeySource: apiKeyInfo.source,
     model: args.model,
     baseUrl: args.baseUrl,
     timeout: args.timeout,
@@ -607,7 +702,7 @@ async function main() {
     return 0;
   }
 
-  printBanner(state, envFile);
+  printBanner(state);
   return repl(state);
 }
 
