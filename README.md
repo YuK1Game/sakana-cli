@@ -56,6 +56,18 @@ sakana --model fugu-ultra
 sakana "このプロジェクトの実装方針を整理して"
 ```
 
+CLIを最新版に更新:
+
+```bash
+sakana update
+```
+
+実行されるnpmコマンドだけ確認:
+
+```bash
+sakana update --dry-run
+```
+
 対話中のコマンド:
 
 ```text

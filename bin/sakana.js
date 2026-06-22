@@ -4,11 +4,13 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import readline from "node:readline/promises";
+import { spawn } from "node:child_process";
 import { stdin as input, stdout as output } from "node:process";
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const DEFAULT_BASE_URL = "https://api.sakana.ai/v1";
 const DEFAULT_MODEL = "fugu";
+const DEFAULT_UPDATE_SOURCE = "github:YuK1Game/sakana-cli#main";
 const MAX_FILE_BYTES = 40_000;
 const ATTACHMENT_RE = /(?<!\S)@([^\s]+)/g;
 
@@ -30,6 +32,7 @@ function usage() {
 
 Usage:
   sakana [options] [prompt...]
+  sakana update [--source SOURCE] [--dry-run]
 
 Options:
   --model fugu|fugu-ultra      Model to use
@@ -49,6 +52,96 @@ Interactive commands:
   /quit            Exit
 
 Attach a file once with @path/to/file in your prompt.`;
+}
+
+function updateUsage() {
+  return `sakana update
+
+Usage:
+  sakana update [options]
+
+Options:
+  --source SOURCE      npm package source to install
+  --dry-run            Print the npm command without running it
+  -h, --help           Show help
+
+Default source:
+  ${DEFAULT_UPDATE_SOURCE}`;
+}
+
+function parseUpdateArgs(argv) {
+  const args = {
+    source: process.env.SAKANA_UPDATE_SOURCE || DEFAULT_UPDATE_SOURCE,
+    dryRun: false,
+  };
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "-h" || arg === "--help") {
+      args.help = true;
+    } else if (arg === "--dry-run") {
+      args.dryRun = true;
+    } else if (arg === "--source") {
+      args.source = argv[++i];
+    } else if (arg.startsWith("--source=")) {
+      args.source = arg.slice("--source=".length);
+    } else {
+      throw new Error(`Unknown update option: ${arg}`);
+    }
+  }
+
+  if (!args.source) {
+    throw new Error("--source must not be empty");
+  }
+  return args;
+}
+
+function runNpmInstallGlobal(source) {
+  const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+  const npmArgs = ["install", "-g", source];
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(npmCommand, npmArgs, {
+      stdio: "inherit",
+      shell: false,
+    });
+
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`npm exited with code ${code}`));
+      }
+    });
+  });
+}
+
+async function runUpdate(argv) {
+  let args;
+  try {
+    args = parseUpdateArgs(argv);
+  } catch (error) {
+    console.error(color("red", error.message));
+    console.error(updateUsage());
+    return 1;
+  }
+
+  if (args.help) {
+    console.log(updateUsage());
+    return 0;
+  }
+
+  const commandText = `npm install -g ${args.source}`;
+  if (args.dryRun) {
+    console.log(commandText);
+    return 0;
+  }
+
+  console.log(`Updating sakana-cli from ${args.source}`);
+  await runNpmInstallGlobal(args.source);
+  console.log(color("green", "sakana-cli is up to date."));
+  return 0;
 }
 
 function parseArgs(argv) {
@@ -463,9 +556,14 @@ async function repl(state) {
 }
 
 async function main() {
+  const argv = process.argv.slice(2);
+  if (argv[0] === "update") {
+    return runUpdate(argv.slice(1));
+  }
+
   let args;
   try {
-    args = parseArgs(process.argv.slice(2));
+    args = parseArgs(argv);
   } catch (error) {
     console.error(color("red", error.message));
     console.error(usage());
@@ -521,4 +619,3 @@ main()
     console.error(color("red", error.stack || error.message));
     process.exitCode = 1;
   });
-
