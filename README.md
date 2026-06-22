@@ -104,6 +104,13 @@ ok: run_command exit_code=0 stdout=2048B
 sakana --timeout 600
 ```
 
+一時的なタイムアウトやHTTP 429/5xxは自動リトライします。回数を変える場合:
+
+```bash
+sakana --retries 4
+sakana --timeout 600 --retries 4
+```
+
 従来のチャットのみで使う場合:
 
 ```bash

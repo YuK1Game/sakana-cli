@@ -8,11 +8,12 @@ import { clearLine, cursorTo, moveCursor } from "node:readline";
 import { spawn } from "node:child_process";
 import { stdin as input, stdout as output } from "node:process";
 
-const VERSION = "0.8.0";
+const VERSION = "0.9.0";
 const DEFAULT_BASE_URL = "https://api.sakana.ai/v1";
 const DEFAULT_MODEL = "fugu";
 const DEFAULT_UPDATE_SOURCE = "github:YuK1Game/sakana-cli#main";
 const DEFAULT_TIMEOUT_SECONDS = 300;
+const DEFAULT_RETRIES = 2;
 const MAX_FILE_BYTES = 40_000;
 const MAX_COMMAND_OUTPUT_BYTES = 30_000;
 const MAX_AGENT_TURNS = 20;
@@ -53,6 +54,7 @@ Options:
   --model fugu|fugu-ultra      Model to use
   --base-url URL               OpenAI-compatible API base URL
   --timeout SECONDS            Request timeout. Default: ${DEFAULT_TIMEOUT_SECONDS}
+  --retries COUNT              Retries for temporary API failures. Default: ${DEFAULT_RETRIES}
   --no-tools                   Disable local file and command tools
   --no-agents                  Do not auto-load AGENTS.md instructions
   --version                    Show version
@@ -166,6 +168,7 @@ function parseArgs(argv) {
     model: process.env.SAKANA_MODEL || DEFAULT_MODEL,
     baseUrl: process.env.SAKANA_BASE_URL || DEFAULT_BASE_URL,
     timeout: Number(process.env.SAKANA_TIMEOUT || String(DEFAULT_TIMEOUT_SECONDS)),
+    retries: Number(process.env.SAKANA_RETRIES || String(DEFAULT_RETRIES)),
     prompt: [],
   };
 
@@ -187,6 +190,10 @@ function parseArgs(argv) {
       args.timeout = Number(argv[++i]);
     } else if (arg.startsWith("--timeout=")) {
       args.timeout = Number(arg.slice("--timeout=".length));
+    } else if (arg === "--retries") {
+      args.retries = Number(argv[++i]);
+    } else if (arg.startsWith("--retries=")) {
+      args.retries = Number(arg.slice("--retries=".length));
     } else if (arg === "--no-tools") {
       args.noTools = true;
     } else if (arg === "--no-agents") {
@@ -203,6 +210,9 @@ function parseArgs(argv) {
   }
   if (!Number.isFinite(args.timeout) || args.timeout <= 0) {
     throw new Error("--timeout must be a positive number");
+  }
+  if (!Number.isInteger(args.retries) || args.retries < 0) {
+    throw new Error("--retries must be a non-negative integer");
   }
   return args;
 }
@@ -492,6 +502,7 @@ function printBanner(state) {
   console.log(`│ cwd: ${color("green", state.cwd)}`);
   console.log(`│ credentials: ${color("dim", credentialLabel)}`);
   console.log(`│ tools: ${state.toolsEnabled ? color("green", "enabled") : color("dim", "disabled")}`);
+  console.log(`│ timeout/retries: ${state.timeout}s / ${state.retries}`);
   console.log(`│ AGENTS.md: ${state.agentFiles.length ? color("green", `${state.agentFiles.length} loaded`) : color("dim", "none")}`);
   console.log("│");
   console.log(`│ Type ${color("bold", "/help")} for commands, ${color("bold", "/quit")} to exit.`);
@@ -645,6 +656,8 @@ base_url: ${state.baseUrl}
 cwd: ${state.cwd}
 credentials: ${state.apiKeySource || "(none)"}
 tools: ${state.toolsEnabled ? "enabled" : "disabled"}
+timeout: ${state.timeout}s
+retries: ${state.retries}
 AGENTS.md:
 ${agents}
 messages: ${state.messages.length}
@@ -797,9 +810,63 @@ function summarizeToolResult(name, result) {
 
 function describeError(error, state, context) {
   if (error?.name === "AbortError") {
-    return `${context} timed out after ${state.timeout}s. Try continuing, or start sakana with --timeout ${Math.max(state.timeout * 2, DEFAULT_TIMEOUT_SECONDS)}.`;
+    return `${context} timed out after ${state.timeout}s after ${state.retries + 1} attempt(s). Try continuing, or start sakana with --timeout ${Math.max(state.timeout * 2, DEFAULT_TIMEOUT_SECONDS)} --retries ${Math.max(state.retries, DEFAULT_RETRIES)}.`;
   }
   return error?.message || String(error);
+}
+
+function describeRetryableAttempt(error, state, context) {
+  if (error?.name === "AbortError") {
+    return `${context} timed out after ${state.timeout}s`;
+  }
+  return error?.message || String(error);
+}
+
+function getHttpStatus(error) {
+  const match = String(error?.message || "").match(/^HTTP\s+(\d+)/);
+  return match ? Number(match[1]) : null;
+}
+
+function isRetryableError(error) {
+  if (error?.name === "AbortError") {
+    return true;
+  }
+  const status = getHttpStatus(error);
+  return status === 429 || (status >= 500 && status <= 599);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function requestWithRetry(state, label, requestFn) {
+  const attempts = state.retries + 1;
+  let lastError;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), state.timeout * 1000);
+
+    try {
+      if (attempt > 1) {
+        console.log(color("dim", `${label}: retry ${attempt}/${attempts}`));
+      }
+      return await requestFn(controller.signal, attempt, attempts);
+    } catch (error) {
+      lastError = error;
+      const retryable = isRetryableError(error);
+      if (!retryable || attempt === attempts) {
+        throw error;
+      }
+      const delayMs = Math.min(1000 * 2 ** (attempt - 1), 8000);
+      console.error(color("red", `${label}: ${describeRetryableAttempt(error, state, label)}. Retrying in ${delayMs / 1000}s...`));
+      await sleep(delayMs);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  throw lastError;
 }
 
 function listFilesTool(args, state) {
@@ -1049,14 +1116,12 @@ async function streamResponse(state, userPrompt) {
   const userMessage = buildUserMessage(userPrompt, state);
   state.messages.push({ role: "user", content: userMessage });
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), state.timeout * 1000);
   const chunks = [];
 
   console.log(`\n${color("bold", color("cyan", "sakana"))}`);
 
   try {
-    const response = await postChatCompletion(state, controller.signal);
+    const response = await requestWithRetry(state, "chat", (signal) => postChatCompletion(state, signal));
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
@@ -1093,8 +1158,6 @@ async function streamResponse(state, userPrompt) {
   } catch (error) {
     state.messages.pop();
     throw new Error(describeError(error, state, "Chat request"));
-  } finally {
-    clearTimeout(timer);
   }
 
   const answer = chunks.join("");
@@ -1107,17 +1170,15 @@ async function agentResponse(state, userPrompt) {
   state.messages.push({ role: "user", content: userMessage });
 
   for (let turn = 0; turn < MAX_AGENT_TURNS; turn += 1) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), state.timeout * 1000);
     let completion;
 
     try {
-      console.log(color("dim", `agent: turn ${turn + 1}/${MAX_AGENT_TURNS} waiting for ${state.model}...`));
-      completion = await postAgentCompletion(state, controller.signal);
+      completion = await requestWithRetry(state, "agent", (signal, attempt, attempts) => {
+        console.log(color("dim", `agent: turn ${turn + 1}/${MAX_AGENT_TURNS} attempt ${attempt}/${attempts} waiting for ${state.model}...`));
+        return postAgentCompletion(state, signal);
+      });
     } catch (error) {
       throw new Error(describeError(error, state, "Agent request"));
-    } finally {
-      clearTimeout(timer);
     }
 
     const message = completion.choices?.[0]?.message;
@@ -1246,6 +1307,7 @@ async function main() {
     model: args.model,
     baseUrl: args.baseUrl,
     timeout: args.timeout,
+    retries: args.retries,
     toolsEnabled: !args.noTools,
     cwd,
     agentFiles,
@@ -1274,6 +1336,6 @@ main()
     process.exitCode = code;
   })
   .catch((error) => {
-    console.error(color("red", error.stack || error.message));
+    console.error(color("red", `Error: ${error.message || error}`));
     process.exitCode = 1;
   });
