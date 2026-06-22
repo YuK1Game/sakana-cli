@@ -1,21 +1,37 @@
 # sakana-cli
 
-Codex CLI 風に Sakana Fugu と対話するためのローカルCLIです。
+Codex CLI 風に Sakana Fugu と対話するためのNode.js CLIです。Pythonは不要です。
+
+## Requirements
+
+- Node.js 22+
 
 ## Install
 
+GitHubから直接インストール:
+
 ```bash
-cd /home/ubuntu/projects/sakana-cli
-python3 -m venv .venv
-.venv/bin/pip install -e .
-mkdir -p ~/.local/bin
-ln -sf /home/ubuntu/projects/sakana-cli/.venv/bin/sakana ~/.local/bin/sakana
+npm install -g github:YuK1Game/sakana-cli
 ```
 
-`~/.local/bin` が `PATH` に入っていれば、どのプロジェクトからでも起動できます。
+ローカルからインストール:
+
+```bash
+cd /home/ubuntu/projects/sakana-cli
+npm install -g .
+```
+
+インストール後、どのプロジェクトからでも起動できます。
 
 ```bash
 sakana
+```
+
+開発中にこのディレクトリへリンクしたい場合:
+
+```bash
+cd /home/ubuntu/projects/sakana-cli
+npm link
 ```
 
 ## API Key
@@ -56,6 +72,11 @@ sakana "このプロジェクトの実装方針を整理して"
 プロンプト内で `@path/to/file` と書くと、そのファイル内容を一回だけ添付します。
 
 ```text
-@src/main.py このコードをレビューして
+@src/main.js このコードをレビューして
 ```
 
+## Development
+
+```bash
+npm run check
+```

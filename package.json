@@ -1,0 +1,20 @@
+{
+  "name": "sakana-cli",
+  "version": "0.2.0",
+  "description": "A Codex-like interactive CLI for Sakana Fugu.",
+  "type": "module",
+  "bin": {
+    "sakana": "./bin/sakana.js"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check": "node --check bin/sakana.js"
+  },
+  "license": "MIT"
+}
