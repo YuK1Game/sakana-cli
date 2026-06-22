@@ -7,11 +7,13 @@ import readline from "node:readline/promises";
 import { spawn } from "node:child_process";
 import { stdin as input, stdout as output } from "node:process";
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const DEFAULT_BASE_URL = "https://api.sakana.ai/v1";
 const DEFAULT_MODEL = "fugu";
 const DEFAULT_UPDATE_SOURCE = "github:YuK1Game/sakana-cli#main";
 const MAX_FILE_BYTES = 40_000;
+const MAX_COMMAND_OUTPUT_BYTES = 30_000;
+const MAX_AGENT_TURNS = 20;
 const ATTACHMENT_RE = /(?<!\S)@([^\s]+)/g;
 
 const colors = {
@@ -38,6 +40,7 @@ Options:
   --model fugu|fugu-ultra      Model to use
   --base-url URL               OpenAI-compatible API base URL
   --timeout SECONDS            Request timeout
+  --no-tools                   Disable local file and command tools
   --version                    Show version
   -h, --help                   Show help
 
@@ -170,6 +173,8 @@ function parseArgs(argv) {
       args.timeout = Number(argv[++i]);
     } else if (arg.startsWith("--timeout=")) {
       args.timeout = Number(arg.slice("--timeout=".length));
+    } else if (arg === "--no-tools") {
+      args.noTools = true;
     } else if (arg.startsWith("-")) {
       throw new Error(`Unknown option: ${arg}`);
     } else {
@@ -326,9 +331,10 @@ function resolveApiKey({ shellApiKey, credentialsFile, envFile }) {
 function makeSystemPrompt(cwd) {
   return [
     "あなたはCodex CLIのように、ターミナル上で開発を支援する実用的なAIアシスタントです。",
-    "ユーザーはローカルのプロジェクトで作業しています。回答は簡潔に、実装・設計・デバッグに直接使える形にしてください。",
-    "ファイル編集やコマンド実行が必要な場合は、具体的なコマンド、パッチ方針、注意点を示してください。",
-    "不明点があれば、作業を止める前に合理的な仮定を置いて進める案を提示してください。",
+    "ユーザーはローカルのプロジェクトで作業しています。必要なファイル作成、編集、検証コマンド実行は利用可能なツールで自分で行ってください。",
+    "実装を依頼されたら、原則として確認待ちで止まらず、合理的な仮定を置いて作業を完了してください。",
+    "ユーザーにコマンド実行やファイル作成を依頼するだけで終わらないでください。あなた自身がツールを呼び出して作業してください。",
+    "作業後は、変更内容と検証結果を簡潔に報告してください。",
     `現在の作業ディレクトリ: ${cwd}`,
   ].join("\n");
 }
@@ -346,6 +352,13 @@ function expandHome(rawPath) {
 function resolvePath(rawPath, cwd) {
   const expanded = expandHome(rawPath);
   return path.resolve(cwd, expanded);
+}
+
+function assertInsideCwd(filePath, cwd) {
+  const relative = path.relative(cwd, filePath);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error(`Path is outside the current workspace: ${filePath}`);
+  }
 }
 
 function readTextFile(filePath) {
@@ -419,6 +432,7 @@ function printBanner(state) {
   console.log(`│ model: ${color("cyan", state.model)}`);
   console.log(`│ cwd: ${color("green", state.cwd)}`);
   console.log(`│ credentials: ${color("dim", credentialLabel)}`);
+  console.log(`│ tools: ${state.toolsEnabled ? color("green", "enabled") : color("dim", "disabled")}`);
   console.log("│");
   console.log(`│ Type ${color("bold", "/help")} for commands, ${color("bold", "/quit")} to exit.`);
   console.log(color("cyan", "╰───────────────────────────────────────────────────╯"));
@@ -446,9 +460,213 @@ console.log(`model: ${state.model}
 base_url: ${state.baseUrl}
 cwd: ${state.cwd}
 credentials: ${state.apiKeySource || "(none)"}
+tools: ${state.toolsEnabled ? "enabled" : "disabled"}
 messages: ${state.messages.length}
 context files:
 ${context}`);
+}
+
+function getToolDefinitions() {
+  return [
+    {
+      type: "function",
+      function: {
+        name: "list_files",
+        description: "List files under a path inside the current workspace.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "Directory path relative to the current workspace." },
+            max_depth: { type: "number", description: "Maximum directory depth to traverse. Default 2." },
+          },
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "read_file",
+        description: "Read a UTF-8 text file inside the current workspace.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "File path relative to the current workspace." },
+          },
+          required: ["path"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "write_file",
+        description: "Create or overwrite a UTF-8 text file inside the current workspace. Parent directories are created automatically.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: { type: "string", description: "File path relative to the current workspace." },
+            content: { type: "string", description: "Complete file content to write." },
+          },
+          required: ["path", "content"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "run_command",
+        description: "Run a shell command in the current workspace and return stdout/stderr. Use for setup, tests, builds, and inspections.",
+        parameters: {
+          type: "object",
+          properties: {
+            command: { type: "string", description: "Shell command to run." },
+            timeout_seconds: { type: "number", description: "Timeout in seconds. Default 60, max 300." },
+          },
+          required: ["command"],
+        },
+      },
+    },
+  ];
+}
+
+function parseToolArguments(rawArguments) {
+  if (!rawArguments) {
+    return {};
+  }
+  if (typeof rawArguments === "object") {
+    return rawArguments;
+  }
+  return JSON.parse(rawArguments);
+}
+
+function isDeniedCommand(command) {
+  const deniedPatterns = [
+    /\brm\s+-[^&|;]*r[^&|;]*f\b/,
+    /\bgit\s+reset\s+--hard\b/,
+    /\bgit\s+checkout\s+--\s+/,
+    /\bsudo\b/,
+    />\s*\/dev\/sd[a-z]/,
+  ];
+  return deniedPatterns.some((pattern) => pattern.test(command));
+}
+
+function truncateOutput(text, maxBytes = MAX_COMMAND_OUTPUT_BYTES) {
+  const data = Buffer.from(String(text));
+  if (data.length <= maxBytes) {
+    return String(text);
+  }
+  return `${data.subarray(0, maxBytes).toString("utf8")}\n[truncated after ${maxBytes} bytes]`;
+}
+
+function listFilesTool(args, state) {
+  const start = resolvePath(args.path || ".", state.cwd);
+  assertInsideCwd(start, state.cwd);
+  if (!fs.existsSync(start)) {
+    throw new Error(`Path does not exist: ${args.path || "."}`);
+  }
+  const maxDepth = Math.max(0, Math.min(Number(args.max_depth ?? 2), 8));
+  const results = [];
+
+  function walk(current, depth) {
+    const entries = fs.readdirSync(current, { withFileTypes: true })
+      .filter((entry) => ![".git", "node_modules", ".venv", "dist"].includes(entry.name))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    for (const entry of entries) {
+      const entryPath = path.join(current, entry.name);
+      const relative = relativeOrAbsolute(entryPath, state.cwd);
+      results.push(entry.isDirectory() ? `${relative}/` : relative);
+      if (entry.isDirectory() && depth < maxDepth) {
+        walk(entryPath, depth + 1);
+      }
+    }
+  }
+
+  const stat = fs.statSync(start);
+  if (stat.isDirectory()) {
+    walk(start, 0);
+  } else {
+    results.push(relativeOrAbsolute(start, state.cwd));
+  }
+
+  return results.join("\n") || "(empty)";
+}
+
+function readFileTool(args, state) {
+  const filePath = resolvePath(args.path, state.cwd);
+  assertInsideCwd(filePath, state.cwd);
+  return readTextFile(filePath);
+}
+
+function writeFileTool(args, state) {
+  const filePath = resolvePath(args.path, state.cwd);
+  assertInsideCwd(filePath, state.cwd);
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, args.content, "utf8");
+  return `wrote ${relativeOrAbsolute(filePath, state.cwd)} (${Buffer.byteLength(args.content, "utf8")} bytes)`;
+}
+
+function runCommandTool(args, state) {
+  const command = args.command;
+  if (!command || typeof command !== "string") {
+    throw new Error("command must be a non-empty string");
+  }
+  if (isDeniedCommand(command)) {
+    throw new Error(`Refusing potentially destructive command: ${command}`);
+  }
+
+  const timeoutSeconds = Math.max(1, Math.min(Number(args.timeout_seconds ?? 60), 300));
+  return new Promise((resolve) => {
+    const child = spawn(command, {
+      cwd: state.cwd,
+      shell: true,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+    }, timeoutSeconds * 1000);
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      resolve(JSON.stringify({
+        command,
+        exit_code: code,
+        signal,
+        stdout: truncateOutput(stdout),
+        stderr: truncateOutput(stderr),
+      }));
+    });
+  });
+}
+
+async function executeToolCall(toolCall, state) {
+  const name = toolCall.function?.name;
+  const args = parseToolArguments(toolCall.function?.arguments || "{}");
+  console.log(color("dim", `tool: ${name}`));
+
+  if (name === "list_files") {
+    return listFilesTool(args, state);
+  }
+  if (name === "read_file") {
+    return readFileTool(args, state);
+  }
+  if (name === "write_file") {
+    return writeFileTool(args, state);
+  }
+  if (name === "run_command") {
+    return runCommandTool(args, state);
+  }
+  throw new Error(`Unknown tool: ${name}`);
 }
 
 function handleCommand(line, state) {
@@ -539,6 +757,35 @@ async function postChatCompletion(state, signal) {
   return response;
 }
 
+async function postAgentCompletion(state, signal) {
+  const url = `${state.baseUrl.replace(/\/+$/, "")}/chat/completions`;
+  const body = {
+    model: state.model,
+    messages: state.messages,
+    stream: false,
+  };
+  if (state.toolsEnabled) {
+    body.tools = getToolDefinitions();
+    body.tool_choice = "auto";
+  }
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${state.apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  if (!response.ok) {
+    const responseBody = await response.text();
+    throw new Error(`HTTP ${response.status}: ${responseBody}`);
+  }
+  return response.json();
+}
+
 function parseStreamLine(line) {
   if (!line.startsWith("data:")) {
     return "";
@@ -608,6 +855,60 @@ async function streamResponse(state, userPrompt) {
   return answer;
 }
 
+async function agentResponse(state, userPrompt) {
+  const userMessage = buildUserMessage(userPrompt, state);
+  state.messages.push({ role: "user", content: userMessage });
+
+  for (let turn = 0; turn < MAX_AGENT_TURNS; turn += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), state.timeout * 1000);
+    let completion;
+
+    try {
+      completion = await postAgentCompletion(state, controller.signal);
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const message = completion.choices?.[0]?.message;
+    if (!message) {
+      throw new Error("No assistant message in API response");
+    }
+
+    const toolCalls = message.tool_calls || [];
+    state.messages.push({
+      role: "assistant",
+      content: message.content || "",
+      ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+    });
+
+    if (!toolCalls.length) {
+      const answer = message.content || "";
+      if (answer) {
+        console.log(`\n${color("bold", color("cyan", "sakana"))}`);
+        console.log(answer);
+      }
+      return answer;
+    }
+
+    for (const toolCall of toolCalls) {
+      let result;
+      try {
+        result = await executeToolCall(toolCall, state);
+      } catch (error) {
+        result = `Tool error: ${error.message}`;
+      }
+      state.messages.push({
+        role: "tool",
+        tool_call_id: toolCall.id,
+        content: String(result),
+      });
+    }
+  }
+
+  throw new Error(`Stopped after ${MAX_AGENT_TURNS} tool turns`);
+}
+
 async function repl(state) {
   const rl = readline.createInterface({ input, output });
   try {
@@ -625,7 +926,11 @@ async function repl(state) {
       }
 
       try {
-        await streamResponse(state, line);
+        if (state.toolsEnabled) {
+          await agentResponse(state, line);
+        } else {
+          await streamResponse(state, line);
+        }
       } catch (error) {
         console.error(color("red", `Error: ${error.message}`));
       }
@@ -689,6 +994,7 @@ async function main() {
     model: args.model,
     baseUrl: args.baseUrl,
     timeout: args.timeout,
+    toolsEnabled: !args.noTools,
     cwd,
     contextFiles: [],
     systemPrompt: makeSystemPrompt(cwd),
@@ -698,7 +1004,11 @@ async function main() {
 
   const prompt = args.prompt.join(" ").trim();
   if (prompt) {
-    await streamResponse(state, prompt);
+    if (state.toolsEnabled) {
+      await agentResponse(state, prompt);
+    } else {
+      await streamResponse(state, prompt);
+    }
     return 0;
   }
 
